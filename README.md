@@ -19,18 +19,52 @@
 
 ---
 
-## 2. bundle 规模
+## 2. 安装、依赖与配置
 
-整个 bundle 共 **106 个漏洞 task**:
+### 2.1 环境依赖
 
-| 语言 | 数量 |
+本工具**宿主机侧零 Python 第三方依赖**(全部标准库),核心依赖只有两样:
+
+| 依赖 | 说明 |
 |------|------|
-| c_cpp | 60 |
-| python | 35 |
-| go | 11 |
-| **合计** | **106** |
+| **Python ≥ 3.8** | 只用标准库(`urllib`/`json`/`subprocess`/`concurrent.futures` 等),**无需 `pip install`**,也没有 `requirements.txt` |
+| **Docker + sudo** | 流水线以 `sudo docker run` 启动每个 task 的 vul/fix 镜像跑 fuzz,当前用户需能免密 `sudo docker`(或本身在 docker 组) |
 
-`--langs` 可只跑某一种语言(如只跑 c_cpp 做实验)。
+> **关于 libFuzzer:不需要在宿主机安装。** libFuzzer / clang / sanitizer 全部**已编译进每个 task 的 docker 镜像**(OSS-Fuzz 风格),fuzz target 就在镜像内的 `/out/$FUZZ_TARGET`。流水线只是 `docker run` 那个镜像并执行它,宿主机上**不装 libFuzzer、不装 clang、不编译任何东西**。
+
+安装(clone 即用):
+```bash
+git clone https://github.com/karroyan/fuzz-factory.git
+cd fuzz-factory
+python3 --version          # 确认 ≥ 3.8
+sudo docker ps             # 确认 docker 可用、当前用户能 sudo docker
+```
+
+### 2.2 数据(task bundle 与镜像)
+
+fuzz 需要一个 **task bundle**:目录结构为 `task-core/<task>/tests/task_metadata.json`,每个 metadata 里给出该 task 的 `vulnerable_runner_image` / `fixed_runner_image`(如 `local/oss-fuzz-harbor:<cve>-vul`)。这些**镜像必须在本机 docker 里可用**(已 `docker load`/`docker pull`)。
+
+- 在本项目所在集群上,`local/oss-fuzz-harbor:*` 系列镜像已预加载,bundle 路径已由 `local_config.py` 指好,**开箱即用**。
+- 换机器使用需自备:① 一份同结构的 bundle;② 其引用的 docker 镜像已加载到本机。bundle 路径通过下节 `BUNDLE` / `FUZZ_BUNDLE` 指定。
+
+### 2.3 配置(首次使用)
+
+端点、密钥文件、bundle 路径均为本地私有,**不纳入 git**。首次使用请任选其一:
+
+**方式一 · `local_config.py`(推荐)**
+```bash
+cp local_config.example.py local_config.py   # local_config.py 已在 .gitignore
+# 编辑填入你的 BASE_URL / MODEL / KEY_FILE / BUNDLE
+```
+**方式二 · 环境变量**
+```bash
+export OPENAI_BASE_URL="https://your-endpoint/v1"
+export LLM_API_KEY="..."          # 或 MODEL_KEY_FILE 指向含 api_key 的文件
+export FUZZ_BUNDLE="/path/to/ossfuzz-harbor-bundles/<bundle>"
+```
+验证:`python3 agent_assist.py --selftest`,看到 `key=<found>` 且 `backend=real:glm-5.2` 即通。
+
+> 仅跑纯 fuzz / diff / fork 三种模式**不需要**端点与密钥,只需 bundle;端点仅 agent 模式(模式 D)用到。
 
 ---
 
@@ -42,6 +76,7 @@
 | `agent_assist.py` | **agent 脚手架**。读 `description.txt`+`fix.diff`,调 LLM(glm-5.2)产出**种子 + 字典**喂给 fuzzer;带缓存与预生成 |
 | `run_two_phase.sh` | **编排器**。Phase1 全量短预算建 corpus → 自动接 Phase2 只对没出 PoC 的续跑长预算 |
 | `reduce_logs.py` | 日志精简小工具 |
+| `local_config.example.py` | 私有配置模板(复制成 `local_config.py` 填写) |
 
 ### 两阶段策略
 - **Phase1**:全部 task × 短预算(默认 300s),先把好撞的收掉、给每个 task 建持久化 corpus。
@@ -61,33 +96,22 @@
 ```
 
 ### 模式 A · 纯 fuzz(基线)
-最朴素的 libFuzzer:只喂官方 seed_corpus,不做任何定向。
+最朴素的 libFuzzer:只喂官方 seed_corpus,不做任何定向。作为对照基线。
 ```bash
 USE_DIFF=0 FORK=0 ./run_two_phase.sh out_pure 300 1800 4
 ```
-> **示例结果**(`out_0807/`,该轮跑到 17/106 中断):基本撞不出差分 PoC,`no_artifact` 为主。作为对照基线。
 
 ### 模式 B · +diff 定向
 从 `fix.diff` 纯脚本抽取 **libFuzzer 字典(-dict)** 和 **focus_function 候选**,把 fuzz 引向被修改的代码路径(无 LLM)。对应 `build_diff_hints()`。
 ```bash
 USE_DIFF=1 FORK=0 ./run_two_phase.sh out_diff 300 1800 4
 ```
-> **示例结果**(`out_diff_0807/summary_p1.json`,106 task):
-> ```json
-> {"overall": {"tasks": 106, "crashed": 24, "valid_poc": 0, "poc_rate": 0.0}}
-> ```
-> 崩溃数比纯 fuzz 多(字典帮助命中代码路径),但单进程下差分 PoC 仍难产。
 
 ### 模式 C · +fork 并行
-在模式 B 基础上开 libFuzzer **fork 模式**:多子进程并行 + 崩溃/OOM/超时隔离不中断,一轮能持续收集**多个不同 crash**,大幅提高撞到"那个洞"的概率。对应 `run_libfuzzer()` 的 `-fork/-ignore_crashes` 分支。
+在模式 B 基础上开 libFuzzer **fork 模式**:多子进程并行 + 崩溃/OOM/超时隔离不中断,一轮能持续收集**多个不同 crash**,再对去重后的 crash 逐个差分(只要有一个是 vul 专属就算命中),大幅提高撞到"那个洞"的概率。对应 `run_libfuzzer()` 的 `-fork/-ignore_crashes` 分支。
 ```bash
 USE_DIFF=1 FORK=6 ./run_two_phase.sh out_fork 300 1800 1
 ```
-> **示例结果**(`out_j1f6_0807/`,106 task,FORK=6):**首次跑出 2 个有效 PoC** —— `go-yaml`(go)、`gpac-cve-2023-0358`(c_cpp)。
-> ```json
-> {"overall": {"tasks": 106, "crashed": 25, "valid_poc": 2, "poc_rate": 0.019}}
-> ```
-> 一个成功记录的 crash 栈(go-yaml,`gopkg.in/yaml.v3` 递归解析 deadly signal),存于 `out_j1f6_0807/pocs/<task>/error.txt`。
 
 ### 模式 D · +agent 种子
 在模式 C 基础上开 **agent 脚手架**:LLM 读漏洞描述 + diff,产出**结构化种子写进 corpus + 字典 token**,让 fuzzer 在更靠近漏洞的起点上变异。**agent 绝不直接给崩溃字节**,只提供引导。
@@ -97,13 +121,8 @@ python3 agent_assist.py --precompute --out out_agent --langs c_cpp --jobs 6
 # 再开 AGENT=1 跑
 AGENT=1 USE_DIFF=1 FORK=2 ./run_two_phase.sh out_agent 300 600 4 c_cpp
 ```
-> **示例结果**(`out_ab_agent/`,60 个 c_cpp,Phase1 已完成、Phase2 进行中):
-> ```json
-> {"overall": {"tasks": 60, "crashed": 18, "valid_poc": 2, "poc_rate": 0.033}}
-> ```
-> 两个成功:`gpac-cve-2023-0358`(与模式 C 重复)、**`mruby-cve-2022-0717`(新增)**。
-> - `mruby-cve-2022-0717` 用的是 **real:glm-5.2** 缓存(3 seed / 30 dict)—— **真正由 agent 种子促成的新 PoC**。
-> - `gpac-cve-2023-0358` 那条 agent 缓存其实是 **stub-fallback**,说明该 task 主要还是 fork+diff 的功劳。
+
+> 四种模式在本项目数据集上的实测效果见 **§8**。
 
 ---
 
@@ -121,7 +140,7 @@ description.txt + fix.diff
    libFuzzer 在种子上变异 → 真正发现 PoC
 ```
 
-- **端点**:内部 OpenAI 兼容 `/chat/completions`,模型 `glm-5.2`。端点地址与密钥文件路径放在**未纳入 git 的 `local_config.py`**(见下文「配置」),公开代码只有占位符。
+- **端点**:内部 OpenAI 兼容 `/chat/completions`,模型 `glm-5.2`。端点地址与密钥文件路径放在**未纳入 git 的 `local_config.py`**(见 §2.3),公开代码只有占位符。
 - **缓存**:结果落 `OUT/agent_cache/<task>.json`,precompute 高并发预生成;`--precompute` 只跳过已存在的缓存文件。
 - **回退**:没配 key / API 报错 / JSON 解析失败 → 自动 `stub`,从 diff 抽 token 合成种子(保证管线不断)。
 
@@ -181,41 +200,7 @@ EOF
 
 ---
 
-## 7. 各模式结果汇总
-
-> **说明**:下表与前文各「示例结果」均取自本机跑过的 `out_*/` 目录。**这些输出目录不纳入 git**(见 `.gitignore`),此处数字仅作为**在 106 个漏洞数据集上成功率的示例**,用于展示各模式的相对效果;克隆本仓库后需自行运行才能复现。
-
-| 模式 | 目录(本地) | 关键开关 | 范围 | crashed | valid_poc | 备注 |
-|------|------|----------|------|---------|-----------|------|
-| A 纯fuzz | `out_0807` | 无 | 106(17中断) | — | 0 | 基线 |
-| B +diff | `out_diff_0807` | `USE_DIFF=1` | 106 | 24 | 0 | 崩溃变多,差分仍难产 |
-| C +fork | `out_j1f6_0807` | `USE_DIFF=1 FORK=6` | 106 | 25→34 | **2** | 首次出 PoC(go-yaml, gpac-0358) |
-| D +agent | `out_ab_agent` | `AGENT=1 FORK=2` | 60(c_cpp) | 18 | **2** | 含 1 个新洞 mruby-0717(P2进行中) |
-
-**趋势**:每叠加一层增强,撞到"目标洞"的能力上升。fork 模式带来第一批 PoC;agent 种子在 fork 基础上进一步拿下了 fork 也没出的 `mruby-cve-2022-0717`。
-
----
-
-## 8. 配置(首次使用)
-
-端点、密钥文件、bundle 路径均为本地私有,**不纳入 git**。首次使用请任选其一:
-
-**方式一 · `local_config.py`(推荐)**
-```bash
-cp local_config.example.py local_config.py   # local_config.py 已在 .gitignore
-# 编辑填入你的 BASE_URL / MODEL / KEY_FILE / BUNDLE
-```
-**方式二 · 环境变量**
-```bash
-export OPENAI_BASE_URL="https://your-endpoint/v1"
-export LLM_API_KEY="..."          # 或 MODEL_KEY_FILE 指向含 api_key 的文件
-export FUZZ_BUNDLE="/path/to/ossfuzz-harbor-bundles/<bundle>"
-```
-验证:`python3 agent_assist.py --selftest`,看到 `key=<found>` 且 `backend=real:glm-5.2` 即通。
-
----
-
-## 9. 复现某一模式的最小命令
+## 7. 复现某一模式的最小命令
 
 ```bash
 cd /path/to/fuzz-factory
@@ -230,6 +215,46 @@ AGENT=1 ./run_two_phase.sh out_run 300 600 4 c_cpp 0
 # 断点续跑(跳过已完成,error 的重跑)
 RESUME=1 AGENT=1 ./run_two_phase.sh out_run 300 600 4 c_cpp 0
 ```
+
+---
+
+## 8. 本数据集上的规模与实测效果
+
+以上为通用说明;以下是本项目在自有数据集上跑出来的具体结果。
+
+> **说明**:下列数字取自本机跑过的 `out_*/` 目录。**这些输出目录不纳入 git**(见 `.gitignore`),仅作为**该数据集上成功率的示例**,用于展示各模式的相对效果;克隆本仓库后需自行运行才能复现。
+
+### 8.1 数据集规模
+
+所用 bundle(`ossfuzz-harbor-bundles/lixueyan`)共 **106 个漏洞 task**:
+
+| 语言 | 数量 |
+|------|------|
+| c_cpp | 60 |
+| python | 35 |
+| go | 11 |
+| **合计** | **106** |
+
+`--langs` 可只跑某一种语言(agent 实验只跑了 c_cpp 60 个)。
+
+### 8.2 各模式结果汇总
+
+| 模式 | 目录(本地) | 关键开关 | 范围 | crashed | valid_poc | 备注 |
+|------|------|----------|------|---------|-----------|------|
+| A 纯fuzz | `out_0807` | 无 | 106(17中断) | — | 0 | 基线 |
+| B +diff | `out_diff_0807` | `USE_DIFF=1` | 106 | 24 | 0 | 崩溃变多,差分仍难产 |
+| C +fork | `out_j1f6_0807` | `USE_DIFF=1 FORK=6` | 106 | 25→34 | **2** | 首次出 PoC(go-yaml, gpac-0358) |
+| D +agent | `out_ab_agent` | `AGENT=1 FORK=2` | 60(c_cpp) | 18 | **2** | 含 1 个新洞 mruby-0717(P2进行中) |
+
+### 8.3 关键发现
+
+- **模式 B(+diff)**:崩溃数比纯 fuzz 明显增多(字典帮助命中被修改的代码路径),但单进程下差分 PoC 仍难产(`crash_not_differential` 为主)。
+- **模式 C(+fork)**:**首次跑出 2 个有效 PoC** —— `go-yaml-ghsa-hp87-p4gw-j4gq`(go)、`gpac-cve-2023-0358`(c_cpp)。go-yaml 是 `gopkg.in/yaml.v3` 递归解析 deadly signal,crash 栈存于 `out_j1f6_0807/pocs/<task>/error.txt`。
+- **模式 D(+agent)**:c_cpp 60 个里出 **2 个**(Phase1):
+  - **`mruby-cve-2022-0717`** —— 用的是 **real:glm-5.2** 缓存(3 seed / 30 dict),**模式 C 在同一批 c_cpp 上没跑出、开 agent 后新增的洞**,可归因于 agent 种子;
+  - `gpac-cve-2023-0358` —— 该条 agent 缓存实为 **stub-fallback**,说明主要仍是 fork+diff 的功劳(与模式 C 重复)。
+
+**趋势**:每叠加一层增强,撞到"目标洞"的能力上升。diff 提高崩溃命中,fork 带来第一批差分 PoC,agent 种子在 fork 基础上进一步拿下了 fork 也没出的 `mruby-cve-2022-0717`。
 
 ---
 
